@@ -14,7 +14,10 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="UK Sponsor List API", version="1.0.0")
 
-GOV_PAGE_URL = "https://www.gov.uk/government/publications/register-of-licensed-sponsors-workers"
+# Gov.uk Content API returns JSON — reliable alternative to HTML scraping
+GOV_CONTENT_API_URL = "https://www.gov.uk/api/content/government/publications/register-of-licensed-sponsors-workers"
+# Direct fallback: known stable CSV URL (used if API unreachable)
+FALLBACK_CSV_URL = "https://assets.publishing.service.gov.uk/media/69fdb9468cc72d2f863ea630/2026-05-08_-_Worker_and_Temporary_Worker.csv"
 REFRESH_INTERVAL_SECONDS = 3600  # re-check every hour
 
 # ---------------------------------------------------------------------------
@@ -38,21 +41,40 @@ def normalize(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 async def fetch_latest_csv_url(client: httpx.AsyncClient) -> Optional[str]:
-    """Scrape the gov.uk page to find the current Worker CSV asset URL."""
+    """
+    Use the gov.uk Content API (JSON) to find the current Worker CSV URL.
+    Falls back to the hardcoded URL if the API is unreachable.
+    """
     try:
-        r = await client.get(GOV_PAGE_URL, follow_redirects=True, timeout=30)
+        r = await client.get(GOV_CONTENT_API_URL, follow_redirects=True, timeout=30)
         r.raise_for_status()
+        data = r.json()
+
+        # Attachments live under details.documents[] or details.attachments[]
+        for section in ("documents", "attachments"):
+            for doc in data.get("details", {}).get(section, []):
+                url = doc.get("url", "")
+                if "Worker_and_Temporary_Worker" in url and url.endswith(".csv"):
+                    logger.info("Found CSV via Content API: %s", url)
+                    return url
+
+        # Fallback: scan all string values for a matching asset URL
+        text = r.text
         pattern = (
             r'https://assets\.publishing\.service\.gov\.uk'
-            r'/[^\s"\'<>]+Worker_and_Temporary_Worker[^\s"\'<>]*\.csv'
+            r'/[^"\'<>\s]+Worker_and_Temporary_Worker[^"\'<>\s]*\.csv'
         )
-        matches = re.findall(pattern, r.text)
+        matches = re.findall(pattern, text)
         if matches:
+            logger.info("Found CSV via regex in API response: %s", matches[-1])
             return matches[-1]
-        logger.warning("No Worker CSV link found on gov.uk page")
+
+        logger.warning("CSV URL not found in Content API response — using fallback")
     except Exception as exc:
-        logger.error("Failed to fetch gov.uk page: %s", exc)
-    return None
+        logger.error("Content API request failed: %s", exc)
+
+    logger.info("Using hardcoded fallback CSV URL")
+    return FALLBACK_CSV_URL
 
 
 async def load_csv(url: str, client: httpx.AsyncClient) -> tuple[dict, int, int]:
@@ -138,6 +160,18 @@ async def startup() -> None:
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/refresh")
+async def manual_refresh():
+    """Trigger an immediate reload of the sponsor list."""
+    await refresh()
+    return {
+        "last_updated": store["last_updated"],
+        "company_count": store["company_count"],
+        "entry_count": store["entry_count"],
+        "csv_url": store["csv_url"],
+    }
 
 
 @app.get("/status")
